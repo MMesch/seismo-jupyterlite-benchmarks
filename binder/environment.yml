@@ -1,0 +1,18 @@
+name: seismo-jupyterlite-benchmarks
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - ipykernel
+  - jupyterlab
+  - jupyterlite-core
+  - jupyterlite-pyodide-kernel
+  - nbclient
+  - numpy
+  - matplotlib
+  - obspy
+  - psutil
+  - requests
+  - pip
+  - pip:
+      - pyodide-http

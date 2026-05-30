@@ -1,0 +1,11 @@
+{
+  "LiteBuildConfig": {
+    "contents": [
+      "benchmarking",
+      "notebooks/benchmarked",
+      "notebooks/extras"
+    ],
+    "output_dir": "dist"
+  }
+}
+

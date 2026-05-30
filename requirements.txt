@@ -1,0 +1,11 @@
+ipykernel
+jupyterlab
+jupyterlite-core
+jupyterlite-pyodide-kernel
+nbclient
+numpy
+matplotlib
+obspy
+psutil
+pyodide-http
+requests
