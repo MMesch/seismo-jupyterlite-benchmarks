@@ -213,13 +213,20 @@ from pathlib import Path as _SeismoBenchPath
 
 _seismo_bench_here = _SeismoBenchPath.cwd()
 for _seismo_bench_root in [_seismo_bench_here, *_seismo_bench_here.parents]:
-    if (_seismo_bench_root / "benchmarking" / "seismo_bench.py").exists():
+    if (
+        (_seismo_bench_root / "benchmarking" / "seismo_bench.py").exists()
+        or (_seismo_bench_root / "seismo_bench.py").exists()
+    ):
         if str(_seismo_bench_root) not in _seismo_bench_sys.path:
             _seismo_bench_sys.path.insert(0, str(_seismo_bench_root))
         break
 
-from benchmarking.seismo_bench import make_context as _seismo_bench_make_context
-from benchmarking.seismo_bench import start_run as _seismo_bench_start_run
+try:
+    from benchmarking.seismo_bench import make_context as _seismo_bench_make_context
+    from benchmarking.seismo_bench import start_run as _seismo_bench_start_run
+except ModuleNotFoundError:
+    from seismo_bench import make_context as _seismo_bench_make_context
+    from seismo_bench import start_run as _seismo_bench_start_run
 
 def _seismo_bench_float_from_env(name):
     value = _seismo_bench_os.environ.get(name, "").strip()
