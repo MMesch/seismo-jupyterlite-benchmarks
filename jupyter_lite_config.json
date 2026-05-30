@@ -2,10 +2,10 @@
   "LiteBuildConfig": {
     "contents": [
       "benchmarking",
+      "jupyterlite_contents",
       "notebooks/benchmarked",
       "notebooks/extras"
     ],
     "output_dir": "dist"
   }
 }
-
