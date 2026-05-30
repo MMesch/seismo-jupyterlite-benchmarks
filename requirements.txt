@@ -2,6 +2,7 @@ ipykernel
 jupyterlab
 jupyterlite-core
 jupyterlite-pyodide-kernel
+jupyter-server
 nbclient
 numpy
 matplotlib
