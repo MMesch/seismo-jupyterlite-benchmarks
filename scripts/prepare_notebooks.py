@@ -266,6 +266,9 @@ def _seismo_bench_post_run_cell(result):
     global _SEISMO_BENCH_PENDING_PHASE, _SEISMO_BENCH_PENDING_T0
     if _SEISMO_BENCH_PENDING_PHASE is None:
         return
+    if _SEISMO_BENCH_PENDING_T0 is None:
+        _SEISMO_BENCH_PENDING_PHASE = None
+        return
     raw_cell = getattr(getattr(result, "info", None), "raw_cell", "")
     if "seismo-benchmark-control" in raw_cell:
         return
