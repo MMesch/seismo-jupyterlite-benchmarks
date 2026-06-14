@@ -1,7 +1,7 @@
 ipykernel
 jupyterlab
 jupyterlite-core
-jupyterlite-pyodide-kernel
+jupyterlite-xeus
 jupyter-server
 nbclient
 numpy

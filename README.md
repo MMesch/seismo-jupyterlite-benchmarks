@@ -2,6 +2,8 @@
 
 Representative seismology education notebooks benchmarked across Local Jupyter, MyBinder, and JupyterLite.
 
+The JupyterLite deployment uses a browser-side `xeus-python` kernel with ObsPy and related scientific packages preinstalled from emscripten-forge.
+
 ## Launch
 
 - JupyterLite/GitHub Pages: https://lcbmann.github.io/seismo-jupyterlite-benchmarks/

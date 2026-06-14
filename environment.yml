@@ -1,0 +1,16 @@
+name: seismo-lite-kernel
+channels:
+  - https://repo.prefix.dev/emscripten-forge-4x
+  - https://repo.prefix.dev/conda-forge
+dependencies:
+  - xeus-python
+  - numpy
+  - scipy
+  - matplotlib
+  - pandas
+  - cartopy
+  - obspy
+  - kiwisolver
+  - pip:
+      - pyodide-http
+

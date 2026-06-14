@@ -1,0 +1,11 @@
+name: seismo-lite-build
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - jupyter_server
+  - jupyterlite-core >=0.7
+  - jupyterlite-xeus >=4.3
+  - notebook >=7.5
+
