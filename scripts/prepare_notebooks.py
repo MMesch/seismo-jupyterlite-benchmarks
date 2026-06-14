@@ -20,6 +20,7 @@ ORIGINALS = NOTEBOOKS / "originals"
 BENCHMARKED = NOTEBOOKS / "benchmarked"
 EXTRAS = NOTEBOOKS / "extras"
 TEMP_SOURCE = ROOT / ".prepare_notebooks_source_tmp"
+BENCHMARK_ASSETS = ROOT / "benchmark_assets"
 
 EXCLUDED_DIRS = {".ipynb_checkpoints", "__pycache__"}
 EXCLUDED_SUFFIXES = {".pyc"}
@@ -108,6 +109,7 @@ def main() -> None:
 
         copy_clean_tree(source, ORIGINALS)
         copy_benchmarked_inputs()
+        copy_benchmark_assets()
         copy_extras()
         instrument_primary_notebooks()
     finally:
@@ -142,6 +144,12 @@ def copy_benchmarked_inputs() -> None:
             target = BENCHMARKED / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, target)
+
+
+def copy_benchmark_assets() -> None:
+    if not BENCHMARK_ASSETS.exists():
+        return
+    copy_clean_tree(BENCHMARK_ASSETS, BENCHMARKED)
 
 
 def copy_extras() -> None:
@@ -196,6 +204,9 @@ def clear_outputs(notebook: dict) -> None:
 def apply_compatibility_patches(relative: Path, notebook: dict) -> None:
     """Apply narrow JupyterLite/WASM compatibility patches to benchmark copies."""
 
+    if relative == Path("Noise/NoiseCorrelation.ipynb"):
+        patch_noise_correlation_sources(notebook)
+
     if relative not in {
         Path("Noise/Probabilistic Power Spectral Densities.ipynb"),
         Path("Noise/NoiseCorrelation.ipynb"),
@@ -211,6 +222,28 @@ def apply_compatibility_patches(relative: Path, notebook: dict) -> None:
             if "_seismo_patch_obspy_wasm_io" not in text:
                 set_source(cell, OBS_PY_WASM_COMPAT + "\n" + text)
             return
+
+
+def patch_noise_correlation_sources(notebook: dict) -> None:
+    replacements = {
+        "https://raw.github.com/ashimrijal/NoiseCorrelation/master/data/noise.CI.MLAC.LHZ.2004.294.2005.017.mseed": (
+            "data/noise.CI.MLAC.LHZ.2004.294.2005.017.mseed"
+        ),
+        "https://raw.github.com/ashimrijal/NoiseCorrelation/master/data/noise.CI.PHL.LHZ.2004.294.2005.017.mseed": (
+            "data/noise.CI.PHL.LHZ.2004.294.2005.017.mseed"
+        ),
+        "https://raw.github.com/ashimrijal/NoiseCorrelation/master/data/event.CI.PHL.LHZ.1998.196.1998.196.mseed": (
+            "data/event.CI.PHL.LHZ.1998.196.1998.196.mseed"
+        ),
+    }
+
+    for cell in notebook.get("cells", []):
+        text = source_text(cell)
+        updated = text
+        for old, new in replacements.items():
+            updated = updated.replace(old, new)
+        if updated != text:
+            set_source(cell, updated)
 
 
 OBS_PY_WASM_COMPAT = """# JupyterLite/emscripten compatibility for ObsPy file readers.
