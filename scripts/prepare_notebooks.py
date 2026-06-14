@@ -160,6 +160,7 @@ def instrument_primary_notebooks() -> None:
             notebook = json.load(fh)
 
         clear_outputs(notebook)
+        apply_compatibility_patches(relative, notebook)
         notebook["cells"] = instrument_cells(
             notebook["cells"],
             notebook_name=str(relative).replace("\\", "/"),
@@ -190,6 +191,52 @@ def clear_outputs(notebook: dict) -> None:
         if cell.get("cell_type") == "code":
             cell["outputs"] = []
             cell["execution_count"] = None
+
+
+def apply_compatibility_patches(relative: Path, notebook: dict) -> None:
+    """Apply narrow JupyterLite/WASM compatibility patches to benchmark copies."""
+
+    if relative not in {
+        Path("Noise/Probabilistic Power Spectral Densities.ipynb"),
+        Path("Noise/NoiseCorrelation.ipynb"),
+        Path("ObsPy/ObsPy_Basic_Example.ipynb"),
+    }:
+        return
+
+    for cell in notebook.get("cells", []):
+        if cell.get("cell_type") != "code":
+            continue
+        text = source_text(cell)
+        if "import matplotlib" in text or "pyodide_http.patch_all()" in text:
+            if "_seismo_patch_obspy_wasm_io" not in text:
+                set_source(cell, OBS_PY_WASM_COMPAT + "\n" + text)
+            return
+
+
+OBS_PY_WASM_COMPAT = """# JupyterLite/emscripten compatibility for ObsPy file readers.
+# ObsPy's MiniSEED reader uses np.memmap, which is unavailable in the browser
+# filesystem. Copy file bytes into an ndarray instead.
+import numpy as np
+
+def _seismo_patch_obspy_wasm_io():
+    def _seismo_fake_memmap(filename, dtype=np.uint8, mode=None, offset=0, shape=None, order=None):
+        with open(filename, "rb") as f:
+            f.seek(offset)
+            data = np.fromfile(f, dtype=dtype)
+        if shape is not None:
+            data = data[:int(np.prod(shape))].reshape(shape, order=order or "C")
+        return data
+
+    np.memmap = _seismo_fake_memmap
+
+    try:
+        import pyodide_http
+        pyodide_http.patch_all()
+    except Exception:
+        pass
+
+_seismo_patch_obspy_wasm_io()
+"""
 
 
 def iter_clean_files(root: Path) -> Iterable[Path]:
@@ -340,6 +387,10 @@ def source_text(cell: dict) -> str:
     if isinstance(source, list):
         return "".join(source)
     return str(source)
+
+
+def set_source(cell: dict, source: str) -> None:
+    cell["source"] = source.splitlines(keepends=True)
 
 
 if __name__ == "__main__":
