@@ -67,3 +67,4 @@ wall_time_s, python_peak_memory_mb, platform_peak_memory_mb, success, notes
 - Binder startup time should be recorded separately, not included in notebook runtime.
 - Network-heavy phases, especially in the ObsPy notebook, should be noted because data center latency can dominate timing.
 - To rebuild the benchmarked notebooks from a fresh `JLite/` source folder, run `python scripts/prepare_notebooks.py`.
+- JupyterLite-specific compatibility changes are documented in `docs/jupyterlite-compatibility.md`.

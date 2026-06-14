@@ -246,12 +246,26 @@ def patch_noise_correlation_sources(notebook: dict) -> None:
             set_source(cell, updated)
 
 
-OBS_PY_WASM_COMPAT = """# JupyterLite/emscripten compatibility for ObsPy file readers.
-# ObsPy's MiniSEED reader uses np.memmap, which is unavailable in the browser
-# filesystem. Copy file bytes into an ndarray instead.
+OBS_PY_WASM_COMPAT = """# JupyterLite/emscripten compatibility for ObsPy/Matplotlib.
+# These patches are intentionally restricted to Emscripten/JupyterLite so
+# local and Binder runs keep the standard NumPy/ObsPy/Matplotlib behavior.
+import platform as _seismo_platform
+import sys as _seismo_sys
 import numpy as np
 
+def _seismo_is_emscripten():
+    return (
+        _seismo_sys.platform == "emscripten"
+        or _seismo_platform.system() == "Emscripten"
+        or "Emscripten" in _seismo_platform.platform()
+    )
+
 def _seismo_patch_obspy_wasm_io():
+    if not _seismo_is_emscripten():
+        return
+
+    # ObsPy's MiniSEED reader uses np.memmap, which is unavailable in the
+    # browser filesystem. Copy file bytes into an ndarray instead.
     def _seismo_fake_memmap(filename, dtype=np.uint8, mode=None, offset=0, shape=None, order=None):
         with open(filename, "rb") as f:
             f.seek(offset)
@@ -268,7 +282,104 @@ def _seismo_patch_obspy_wasm_io():
     except Exception:
         pass
 
+def _seismo_patch_matplotlib_psd_for_wasm():
+    if not _seismo_is_emscripten():
+        return
+
+    try:
+        import matplotlib.mlab as _seismo_mlab
+    except Exception:
+        return
+
+    if getattr(_seismo_mlab.psd, "_seismo_wasm_patched", False):
+        return
+
+    def _seismo_window_values(window, nfft, dtype):
+        if window is None:
+            return np.ones(nfft, dtype=float)
+        if callable(window):
+            return np.asarray(window(np.ones(nfft, dtype=dtype)))
+        return np.asarray(window)
+
+    def _seismo_detrend_segment(segment, detrend):
+        if detrend is None:
+            return segment
+        if callable(detrend):
+            return np.asarray(detrend(segment))
+        return segment
+
+    def _seismo_psd_no_large_stride(
+        x,
+        NFFT=None,
+        Fs=None,
+        detrend=None,
+        window=None,
+        noverlap=None,
+        pad_to=None,
+        sides=None,
+        scale_by_freq=None,
+    ):
+        x = np.asarray(x)
+        if x.ndim != 1:
+            x = np.ravel(x)
+        if NFFT is None:
+            NFFT = 256
+        if Fs is None:
+            Fs = 2
+        if noverlap is None:
+            noverlap = 0
+        if pad_to is None:
+            pad_to = NFFT
+        if scale_by_freq is None:
+            scale_by_freq = True
+        NFFT = int(NFFT)
+        noverlap = int(noverlap)
+        pad_to = int(pad_to)
+        step = NFFT - noverlap
+        if step <= 0:
+            raise ValueError("noverlap must be less than NFFT")
+        if len(x) < NFFT:
+            x = np.pad(x, (0, NFFT - len(x)), mode="constant")
+
+        if sides is None or sides == "default":
+            sides = "onesided" if np.isrealobj(x) else "twosided"
+        onesided = sides == "onesided"
+        freqs = np.fft.rfftfreq(pad_to, d=1.0 / Fs) if onesided else np.fft.fftfreq(pad_to, d=1.0 / Fs)
+        win = _seismo_window_values(window, NFFT, x.dtype)
+        if len(win) != NFFT:
+            raise ValueError("The window length must match NFFT")
+        if scale_by_freq:
+            scale = Fs * np.sum(np.abs(win) ** 2)
+        else:
+            scale = np.abs(np.sum(win)) ** 2
+        if scale == 0:
+            raise ValueError("Window has zero power")
+
+        total = None
+        count = 0
+        last_start = len(x) - NFFT
+        for start in range(0, last_start + 1, step):
+            segment = _seismo_detrend_segment(x[start : start + NFFT], detrend)
+            segment = segment * win
+            fft = np.fft.rfft(segment, n=pad_to) if onesided else np.fft.fft(segment, n=pad_to)
+            power = (np.conjugate(fft) * fft).real / scale
+            if onesided and len(power) > 1:
+                if pad_to % 2:
+                    power[1:] *= 2.0
+                else:
+                    power[1:-1] *= 2.0
+            total = power if total is None else total + power
+            count += 1
+
+        if count == 0:
+            raise ValueError("Input data is too short for the requested NFFT")
+        return total / count, freqs
+
+    _seismo_psd_no_large_stride._seismo_wasm_patched = True
+    _seismo_mlab.psd = _seismo_psd_no_large_stride
+
 _seismo_patch_obspy_wasm_io()
+_seismo_patch_matplotlib_psd_for_wasm()
 """
 
 
