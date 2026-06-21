@@ -5,15 +5,10 @@ dependencies:
   - python=3.12
   - ipykernel
   - jupyterlab
-  - jupyterlite-core
-  - jupyterlite-pyodide-kernel
-  - jupyter-server
-  - nbclient
   - numpy
+  - scipy
   - matplotlib
+  - cartopy
   - obspy
   - psutil
   - requests
-  - pip
-  - pip:
-      - pyodide-http
