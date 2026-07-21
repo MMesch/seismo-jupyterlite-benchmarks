@@ -31,7 +31,7 @@ All values are best-of-5 from a single fresh native + JupyterLite run (`micro_be
 | fs_chunk_sweep (per 1 MB read, best across 1M/64K/4K/512B chunks) | how the read cost scales with chunk size | 0.07–0.69 ms | 1333–1363 ms | ~2000× | chunk size doesn't matter — the single `open()` dominates |
 | **os_stat** (per single stat) | 200× `os.stat(path)`, per call | 2.9 μs | **2.05 ms** | **707×** | metadata-only lookup — cheaper than open |
 | **bare_boundary** (per getpid) | 200× `os.getpid()`, per call | 0.65 μs | <5 μs (below timer resolution) | **~1×** | 🎯 the WASM↔JS boundary itself is basically free — expensive things are real FS work, not crossings |
-| **fs_open_close** (per single open+close) | 30× `open()+close()`, per call | 9.3 μs | **1503 ms** | **161,000×** | 🚨🚨 the smoking gun — `open()` alone costs ~1.5 s under xeus on the notebook mount. Mechanism not yet directly confirmed — plausible candidates (see /tmp experiment below) include (a) each `open()` intercepted by the JupyterLite service worker and served via a full HTTP fetch, or (b) the FS backend eagerly materializing the file into WASM heap on open. |
+| **fs_open_close** (per single open+close, 12 MB file) | 30× `open()+close()`, per call | 9.3 μs | **1503 ms** | **161,000×** | 🚨🚨 the smoking gun — but the cost is size-dependent (see file-size sweep below): `open()` on the notebook mount goes through a service-worker sync-XHR bridge that transfers the **entire file body** on every call, at ~8 MB/s effective bandwidth |
 | fs_reads_4k_single_open (per 4 KB read on open handle) | 256× `read(4096)`, per call | 1.5 μs | 5.3 ms | ~3500× | ~280× cheaper than open() itself |
 | fs_seek_read_small (per seek+read pair) | 50× (seek to random offset, read 64 B), per call | 5.8 μs | 26.9 ms | ~4600× | expensive per iteration once the file is open |
 | stream_detrend | `Stream.detrend('linear')` on the 7.77M-sample trace | 418 ms | 392 ms | **0.94×** | 🤯 WASM slightly *faster* — SIMD/JIT wins on the hot loop |
@@ -45,11 +45,13 @@ All values are best-of-5 from a single fresh native + JupyterLite run (`micro_be
 ## The core story
 
 1. **WASM↔JS boundary crossing is essentially free** (~20 μs). Everything expensive is *actual work* inside the emscripten filesystem layer, not the crossing itself.
-2. **`open()` on the notebook filesystem mount costs ~1.5 s per call** — 161,000× native. `/tmp` (MEMFS) opens the same file in 30 μs, ~50,000× faster (see [The /tmp experiment](#the-tmp-experiment--the-slow-open-is-not-universal) below). So the cost is specific to whichever backend serves the notebook working directory, not a WASM or xeus-python universal limit. **The exact mechanism is not yet confirmed** — two leading hypotheses consistent with our data:
-   - **(a) Service-worker fetch on each open()**: JupyterLite registers a service worker that intercepts filesystem requests. Each `open()` on the notebook mount may trigger a full HTTP fetch through the SW, even though the file is bundled locally. `/tmp` bypasses the SW entirely (pure in-heap MEMFS), which is why it is fast.
-   - **(b) Eager materialization into WASM heap on open()**: the notebook FS backend could copy the entire file into WASM linear memory the first time it is opened. Subsequent `read()`s are just memcpys.
-   Both explain the observations equally well; distinguishing them requires either browser DevTools inspection of the service-worker traffic or a targeted probe (e.g. does the *second* `open()` of the same file take the same 1.5 s? — an experiment worth running).
-3. **Post-open reads are much cheaper than opens** — once the file handle is obtained (whatever the mechanism), `read()` is just a memcpy from the WASM heap.
+2. **`open()` on the notebook filesystem mount is expensive and its cost scales with file size** — measured `open_wall ≈ 10 ms + file_size / 8 MB/s`. For a 12 MB file that's ~1.5 s per call, ~161,000× native (the file-size-sweep table below is the direct evidence for the size scaling).
+   **Likely mechanism**, consistent with our measurements and with a comment from a maintainer that the sync `open()` call has to be bridged through a service-worker round trip: Python's `open()` is *synchronous* (interpreter blocks until it returns), while every browser storage API (IndexedDB, `fetch`, OPFS) is *asynchronous*. To span the mismatch, xeus-python appears to issue a synchronous `XMLHttpRequest` from its Web Worker to a URL that the JupyterLite service worker intercepts; the SW does the async storage read and returns the response, and the sync XHR unblocks. If that response contains the whole file body, the per-`open()` bandwidth we see (~8 MB/s) is what we'd expect. **We have not yet directly observed the SW request** (DevTools Network / Application inspection would confirm), so treat "SW-bridge with full-body payload" as the leading working model rather than a proven fact.
+   Consequences that follow if the model is right:
+   - **Every `open()` is effectively a full-file `fetch`**, even when only a few bytes will be read (as in `zipfile.is_zipfile`'s EOCD hunt).
+   - **`/tmp` is fast because MEMFS lives in the WASM instance's linear memory** — no cross-context messaging, `open()` is a hashmap lookup (~30 μs, ~50,000× faster than the notebook mount).
+   - **The highest-leverage optimization is probably "don't ship the body on every open"** — a range-request-aware or handle-only response would let `zipfile.is_zipfile` cost tens of milliseconds instead of 1.5 s. Whether that's realistic depends on the actual implementation.
+3. **Post-open reads are much cheaper than opens** — probably because the whole file body is already in WASM linear memory once `open()` returns (transferred through the SW response, under the model above). Subsequent `read()` calls are just memcpys within the WASM heap. That is why the chunk-size sweep is flat.
 4. **libmseed seismic trace decoding under WASM is almost at native speed** (1.23×). Not a WASM issue at all.
 5. **Imports don't pay the slow `open()`.** The Python site-packages tree lives on a different (MEMFS-like) mount than user notebook files, so `open()` there is microseconds. What the `imports/*` phases measure is likely Python-init execution cost. The WASM/native ratios (stdlib 6.0×, numpy 2.5×, scipy 6.3×, obspy 3.5×, wasm_compat 2.4×) reflect the split of Python-bytecode interpretation (higher penalty, ~5–10×) vs compiled C-extension init (lower penalty, \~2–3×). **Scipy dominates the absolute cold-start (\~6.3 s of 7.4 s WASM) simply because it is the largest library** — natively it already takes \~5× longer than numpy to import.
 6. **scipy runtime under WASM is mixed** (measured): single-pass ops like `detrend` are native-comparable or *slightly faster* (0.77–0.94×), but IIR filters like SOS bandpass are ~1.4× slower (`stream_bandpass` 144 → 195 ms). **Hypothesis** for the direction of the gap: the recurrence relation in the filter cannot be SIMD-vectorized on either side, so both native and WASM run scalar, and WASM's scalar JIT is somewhat behind native `-O3`. This is our reading of a general WASM-vs-native performance pattern; we have not verified it by e.g. comparing generated code.
@@ -80,7 +82,17 @@ All values are best-of-5 from a single fresh native + JupyterLite run (`micro_be
 | 4 KB | 256 | 1336 | 1474 |
 | 512 B | 2048 | 1363 | 1565 |
 
-Reading in 512-byte chunks (2048 syscalls) is **not measurably slower** than reading in one 1 MB chunk. This is consistent with both of the leading `open()` hypotheses in the core story (service-worker fetch vs eager materialization): once the file bytes are in the WASM address space (however they got there), subsequent `read()` calls are a trivial memory copy regardless of chunk size. The whole cost is paid at `open()`.
+Reading in 512-byte chunks (2048 syscalls) is **not measurably slower** than reading in one 1 MB chunk. Once the file bytes are in the WASM address space (transferred at `open()` through the SW bridge), subsequent `read()` calls are trivial memory copies regardless of chunk size. The whole cost is paid at `open()`.
+
+**fs_open_size_sweep** — 10× `open()+close()` on three files of different sizes, all on the notebook mount:
+
+| file (in `../Noise/data/`) | size | native ms/open | WASM ms/open | WASM effective bandwidth |
+|---|---:|---:|---:|---:|
+| `event.CI.PHL.LHZ.1998.196.1998.196.mseed` | 16 KB | 0.010 | **12.8** | 1.25 MB/s (dominated by fixed round-trip) |
+| `GR.FUR..BHN.D.2015.361` | 2 MB | 0.010 | **222** | 9.0 MB/s |
+| `noise.CI.MLAC.LHZ.2004.294.2005.017.mseed` | 12 MB | 0.010 | **1462** | 8.2 MB/s |
+
+**Native is flat** because `open()` doesn't touch data — it just returns a file descriptor. **WASM scales strongly with file size**, converging on ~8 MB/s throughput for medium/large files with a ~10 ms floor. The linear fit `open_wall ≈ 10 ms + file_size / 8 MB/s` predicts all three points within a few percent. This is direct evidence that some byte-transfer proportional to file size happens on every `open()` call. The likely mechanism (see core-story bullet 2) is that each `open()` transfers the whole file body through the service-worker sync-XHR bridge — but we have not yet observed the SW traffic directly.
 
 **np_correlate_sweep** — direct-mode cross-correlation at three sizes:
 
@@ -117,7 +129,7 @@ If the model "open() = ~1.5 s; everything after is trivial" is right, then every
 | **`obspy_read_path_format`** (tarfile 4 + zipfile 1 + memmap 1) | 6 | 6 × 1500 + 83 = 9083 | 9184 | ✓ |
 | **`obspy_read_path`** (+ auto-detect probes) | ~6 + isFormat | +~1400 for probes → ~10500 | 10566 | ✓ |
 
-Regardless of the underlying mechanism (service-worker fetch, eager materialization, or something else), the **empirical** conclusion is that most of the "why is JupyterLite slow" story reduces to **counting how many times `open()` is called**. Reducing that count is the highest-leverage optimization anywhere in the WASM-Python stack.
+The likely mechanism (see core-story bullet 2) is that the SW round trip transfers the full file body, so a more precise model is `open_cost ≈ 10 ms + file_size / 8 MB/s` per call. For a fixed-size dataset the practical takeaway is the same regardless of the exact mechanism: **the story of "why is JupyterLite slow" reduces to counting how many times `open()` is called**, and each call is priced in seconds if the file is big.
 
 ## The `/tmp` experiment — the slow `open()` is not universal
 
@@ -133,7 +145,7 @@ To test whether the 1.45 s `open()` cost is a xeus-python-wide phenomenon or spe
 
 The last two rows are the punchline: `obspy.read` from /tmp under WASM runs within **1.26× of native**. That means the entire 130× penalty for the same call from the notebook mount is not a WASM problem — it is a *notebook-FS-backend* problem, and /tmp shows what the same WASM stack can do when it's out of the way.
 
-**Interpretation.** `/tmp` in xeus-python behaves like a pure in-heap mount (MEMFS or equivalent): reading 12 MB in 1 ms = ~12 GB/s = native memcpy speed, `open()` at 30 μs = trivial hashmap lookup. **The 1.45 s open() cost is specific to whichever filesystem backend serves the notebook working directory** — this is measured. The precise mechanism (service-worker fetch, lazy IndexedDB load, or eager materialization) is **not yet directly confirmed** but the /tmp comparison rules out anything intrinsic to WASM or xeus-python. See core-story bullet 2 for the two leading candidates.
+**Interpretation.** `/tmp` in xeus-python is a MEMFS mount — files live directly in the WASM instance's linear memory. `open()` there is a hashmap lookup with no cross-context messaging (30 μs), and `read()` is a memcpy within the WASM heap (~12 GB/s = native memcpy speed for the 12 MB payload). The notebook mount, by contrast, has to bridge sync-Python to async-browser-storage — most likely via a service-worker sync-XHR round trip that appears to transfer the whole file body on every `open()` (see core-story bullet 2). `/tmp` bypasses whatever bridging the notebook mount does.
 
 **Consequence.** Copying a file to `/tmp` once and then reading it from there runs the entire ObsPy pipeline at native speed. Total wall-clock: `1700 ms (one-shot copy) + N × 90 ms` versus `N × 1535 ms` for the `BytesIO` trick — /tmp wins after just 2 reads of the same file, and works with libraries that don't accept file-like objects.
 
@@ -207,16 +219,20 @@ Additional per-notebook wins (each independently applicable):
 
 3. **First-class `bytes` acceptance in `_read_mseed`**: today the path branch calls `np.memmap`, the file-object branch does `from_buffer(fileobj.read())`, and there is no direct `bytes` branch. Add one so user code can go straight from `bytes` to a stream without wrapping in `BytesIO`.
 
-### Ideas for xeus-python / jupyterlite-xeus (root-cause fixes)
+### Ideas to explore on the xeus-python / jupyterlite-xeus side
 
-The measured bottleneck is that each `open()` on the notebook filesystem mount takes ~1.5 s, regardless of what is read afterwards. **Two hypotheses about the mechanism** (see core-story bullet 2): each open goes through the service worker as an HTTP fetch, or the FS backend eagerly copies the whole file into the WASM heap on first open. The proposed fixes below would help under either hypothesis, but the right specific fix depends on which one is correct — worth an experiment (e.g. compare Chrome DevTools Network + Application panels with a paused breakpoint on `FS.open`).
+Under the working model in core-story bullet 2 (each notebook-mount `open()` goes through a sync bridge whose response carries the full file body), the following would each cut different parts of the cost. None of them is a decided fix — all need discussion with the maintainers and validation against the actual implementation.
 
-1. **Cache `open()`ed files within a session**: on first `open()`, materialize into a MEMFS-like slot; subsequent `open()`s on the same path return an in-memory view. Even a per-notebook-session LRU would collapse the compression-probe pathology from N × 1.5 s to a single 1.5 s cost per file.
+1. **Defer the body transfer past `open()` — return just a handle, fetch bytes lazily on `read(offset, length)`.** Under the current model this would drop `zipfile.is_zipfile(path)` from ~1.5 s to tens of ms (reads ~22 bytes from the tail), and `tarfile.is_tarfile` from ~6 s to tens of ms. Highest apparent leverage, but the implementation cost depends on the underlying storage backend and on how the bridge is structured; may not fit cleanly into today's architecture.
 
-2. **Lazy-load only the range actually read**: switch the notebook mount to an HTTP-range-request or IDBFS-lazy backend where small `read()`s pay only for the bytes requested. Then `open()` alone would be cheap; today it pays the full-file cost even when only 64 bytes are subsequently read.
+2. **Cache `open()`ed file bodies within a session.** An in-WASM per-session LRU keyed on file paths would collapse `tarfile.is_tarfile`'s 4-open pathology from 4 × 1.5 s to 1 × 1.5 s + 3 × trivial. Smaller change than #1, still meaningful even if #1 is out of reach.
 
-3. **Ship [WASM Relaxed SIMD](https://github.com/WebAssembly/relaxed-simd) builds** of numpy/scipy from emscripten-forge. Adds FMA (fused multiply-add) and maybe closes half the ~15× per-multiply-add gap for SIMD-vectorizable numpy loops. Both Firefox and Chrome support it.
+3. **[JSPI (JavaScript Promise Integration)](https://github.com/WebAssembly/js-promise-integration)** — a newer WebAssembly proposal (behind a flag in current Chrome, being standardised) that lets WASM code `await` a JS Promise directly, without needing a service-worker sync-XHR bridge or `SharedArrayBuffer`. If it becomes broadly available and xeus-python adopts it, the sync/async impedance mismatch that drives the whole SW-bridge design would go away. Very interesting to track, but not a solution one can act on today. (Note: `SharedArrayBuffer + Atomics.wait` behind COOP/COEP was our first thought here, but COOP/COEP is impractical to require of JupyterLite deployments and would only remove the round-trip latency without addressing the per-body transfer — so it's not a promising avenue.)
+
+4. **Move small bundled notebook contents to MEMFS at kernel startup** (as `/tmp` already is). Trades startup RAM for zero-cost subsequent access. Reasonable for small bundled datasets shipped alongside the notebook; wasteful for large collections a user might never touch.
+
+5. **Ship [WASM Relaxed SIMD](https://github.com/WebAssembly/relaxed-simd) builds** of numpy/scipy from emscripten-forge. Adds FMA (fused multiply-add) and — if our SIMD-width hypothesis for the ~15× `np.correlate` gap is correct — might close a significant fraction of it. Both Firefox and Chrome support it. Independent of the FS story; benefits all numerically heavy notebooks.
 
 ### For the broader scientific-Python community
 
-- The per-mount-`open()`-eager-materialization pattern **is not obvious to library authors and is invisible to native profilers**. Any Python library that does `Path.exists()`, `os.stat()`, or repeated small `open()`s on user data (netCDF4, h5py, GDAL, pyrocko, xarray, ...) will hit the same wall on JupyterLite. A community-shared "known-slow patterns under WebAssembly" document + a lint rule (`wasm-perf-check`) would compound value across the ecosystem.
+- The per-`open()`-full-file-transfer pattern **is not obvious to library authors and is invisible to native profilers**. Any Python library that does repeated `open()`s on user data (netCDF4, h5py, GDAL, pyrocko, xarray, tarfile/zipfile-based readers, ...) will hit the same wall on JupyterLite — worse the larger the files. A community-shared "known-slow patterns under WebAssembly" document + a lint rule (`wasm-perf-check`) would compound value across the ecosystem.
