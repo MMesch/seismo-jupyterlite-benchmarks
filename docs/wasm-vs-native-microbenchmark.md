@@ -31,7 +31,7 @@ All values are best-of-5 from a single fresh native + JupyterLite run (`micro_be
 | fs_chunk_sweep (per 1 MB read, best across 1M/64K/4K/512B chunks) | how the read cost scales with chunk size | 0.07–0.69 ms | 1333–1363 ms | ~2000× | chunk size doesn't matter — the single `open()` dominates |
 | **os_stat** (per single stat) | 200× `os.stat(path)`, per call | 2.9 μs | **2.05 ms** | **707×** | metadata-only lookup — cheaper than open |
 | **bare_boundary** (per getpid) | 200× `os.getpid()`, per call | 0.65 μs | <5 μs (below timer resolution) | **~1×** | 🎯 the WASM↔JS boundary itself is basically free — expensive things are real FS work, not crossings |
-| **fs_open_close** (per single open+close) | 30× `open()+close()`, per call | 9.3 μs | **1503 ms** | **161,000×** | 🚨🚨 the smoking gun — `open()` alone costs ~1.5 s under xeus on the notebook mount. Almost certainly eagerly materializes the file into WASM heap (see /tmp experiment below for proof it is mount-specific). |
+| **fs_open_close** (per single open+close) | 30× `open()+close()`, per call | 9.3 μs | **1503 ms** | **161,000×** | 🚨🚨 the smoking gun — `open()` alone costs ~1.5 s under xeus on the notebook mount. Mechanism not yet directly confirmed — plausible candidates (see /tmp experiment below) include (a) each `open()` intercepted by the JupyterLite service worker and served via a full HTTP fetch, or (b) the FS backend eagerly materializing the file into WASM heap on open. |
 | fs_reads_4k_single_open (per 4 KB read on open handle) | 256× `read(4096)`, per call | 1.5 μs | 5.3 ms | ~3500× | ~280× cheaper than open() itself |
 | fs_seek_read_small (per seek+read pair) | 50× (seek to random offset, read 64 B), per call | 5.8 μs | 26.9 ms | ~4600× | expensive per iteration once the file is open |
 | stream_detrend | `Stream.detrend('linear')` on the 7.77M-sample trace | 418 ms | 392 ms | **0.94×** | 🤯 WASM slightly *faster* — SIMD/JIT wins on the hot loop |
@@ -45,12 +45,15 @@ All values are best-of-5 from a single fresh native + JupyterLite run (`micro_be
 ## The core story
 
 1. **WASM↔JS boundary crossing is essentially free** (~20 μs). Everything expensive is *actual work* inside the emscripten filesystem layer, not the crossing itself.
-2. **`open()` on the notebook filesystem mount costs ~1.5 s per call** — 161,000× native. `/tmp` (MEMFS) opens the same file in 30 μs, ~50,000× faster (see [The /tmp experiment](#the-tmp-experiment--the-slow-open-is-not-universal) below). So the cost is specific to whichever backend serves the notebook working directory (likely a lazy-loading IndexedDB or fetch-cached shim), not a WASM or xeus-python universal limit.
-3. **Post-open reads are much cheaper than opens in this example** — once the file is in WASM memory, `read()` is just a memcpy from the WASM heap.
+2. **`open()` on the notebook filesystem mount costs ~1.5 s per call** — 161,000× native. `/tmp` (MEMFS) opens the same file in 30 μs, ~50,000× faster (see [The /tmp experiment](#the-tmp-experiment--the-slow-open-is-not-universal) below). So the cost is specific to whichever backend serves the notebook working directory, not a WASM or xeus-python universal limit. **The exact mechanism is not yet confirmed** — two leading hypotheses consistent with our data:
+   - **(a) Service-worker fetch on each open()**: JupyterLite registers a service worker that intercepts filesystem requests. Each `open()` on the notebook mount may trigger a full HTTP fetch through the SW, even though the file is bundled locally. `/tmp` bypasses the SW entirely (pure in-heap MEMFS), which is why it is fast.
+   - **(b) Eager materialization into WASM heap on open()**: the notebook FS backend could copy the entire file into WASM linear memory the first time it is opened. Subsequent `read()`s are just memcpys.
+   Both explain the observations equally well; distinguishing them requires either browser DevTools inspection of the service-worker traffic or a targeted probe (e.g. does the *second* `open()` of the same file take the same 1.5 s? — an experiment worth running).
+3. **Post-open reads are much cheaper than opens** — once the file handle is obtained (whatever the mechanism), `read()` is just a memcpy from the WASM heap.
 4. **libmseed seismic trace decoding under WASM is almost at native speed** (1.23×). Not a WASM issue at all.
 5. **Imports don't pay the slow `open()`.** The Python site-packages tree lives on a different (MEMFS-like) mount than user notebook files, so `open()` there is microseconds. What the `imports/*` phases measure is likely Python-init execution cost. The WASM/native ratios (stdlib 6.0×, numpy 2.5×, scipy 6.3×, obspy 3.5×, wasm_compat 2.4×) reflect the split of Python-bytecode interpretation (higher penalty, ~5–10×) vs compiled C-extension init (lower penalty, \~2–3×). **Scipy dominates the absolute cold-start (\~6.3 s of 7.4 s WASM) simply because it is the largest library** — natively it already takes \~5× longer than numpy to import.
-6. **scipy runtime under WASM is mixed**: single-pass ops like `detrend` are native-comparable or *slightly faster* (0.77–0.94×), but IIR filters like SOS bandpass are ~1.4× slower (`stream_bandpass` 144 → 195 ms). The recurrence relation in the filter cannot be SIMD-vectorized on either side, so both native and WASM run scalar — and WASM's scalar JIT is behind native `-O3`.
-7. **numpy inner loops are slower under WASM in proportion to SIMD-vectorization opportunity** — asymptotically **~15× slower** for tight SIMD-friendly loops (direct-mode `np.correlate` at N=72000: 4155 ms WASM vs 279 ms native). Cause: WASM SIMD128 vs native AVX-512 (2–4× width gap), no FMA fusion (~2×), less aggressive loop unrolling (\~1.5×). At smaller N the ratio is smaller (\~6× at N=7200) because native hasn't yet warmed its out-of-order engine and prefetcher; the \~15× is the asymptotic per-multiply-add cost, not a size-dependent penalty.
+6. **scipy runtime under WASM is mixed** (measured): single-pass ops like `detrend` are native-comparable or *slightly faster* (0.77–0.94×), but IIR filters like SOS bandpass are ~1.4× slower (`stream_bandpass` 144 → 195 ms). **Hypothesis** for the direction of the gap: the recurrence relation in the filter cannot be SIMD-vectorized on either side, so both native and WASM run scalar, and WASM's scalar JIT is somewhat behind native `-O3`. This is our reading of a general WASM-vs-native performance pattern; we have not verified it by e.g. comparing generated code.
+7. **numpy inner loops are slower under WASM by a measured factor** — asymptotically ~15× slower for tight SIMD-friendly loops (direct-mode `np.correlate` at N=72000: 4155 ms WASM vs 279 ms native, both measured). **Hypothesis** for the mechanism: WASM SIMD128 vs native AVX-512 (2–4× width gap), no FMA fusion (~2×), less aggressive loop unrolling (~1.5×) — the product would give roughly the observed ratio. We have not verified this by disassembling either build. At smaller N the ratio is smaller (~6× at N=7200) because native hasn't yet warmed its out-of-order engine and prefetcher; the ~15× is the asymptotic per-multiply-add cost, not a size-dependent penalty. That part *is* measured (see the ns/MADD table below).
 
 ## Full decomposition of `obspy.read(path, format="MSEED")` = 9184 ms measured
 
@@ -77,7 +80,7 @@ All values are best-of-5 from a single fresh native + JupyterLite run (`micro_be
 | 4 KB | 256 | 1336 | 1474 |
 | 512 B | 2048 | 1363 | 1565 |
 
-Reading in 512-byte chunks (2048 syscalls) is **not measurably slower** than reading in one 1 MB chunk. This is probably experimental confirmation of the "open() eagerly loading the file into WASM heap" model — once the file is in memory, `read()` is a trivial memory copy regardless of size, and the whole cost is the initial `open()`.
+Reading in 512-byte chunks (2048 syscalls) is **not measurably slower** than reading in one 1 MB chunk. This is consistent with both of the leading `open()` hypotheses in the core story (service-worker fetch vs eager materialization): once the file bytes are in the WASM address space (however they got there), subsequent `read()` calls are a trivial memory copy regardless of chunk size. The whole cost is paid at `open()`.
 
 **np_correlate_sweep** — direct-mode cross-correlation at three sizes:
 
@@ -92,7 +95,7 @@ Direct correlation is O(N²) — `mode='same'` does N² multiply-adds. (72000/72
 - **WASM ns/MADD is essentially flat** (0.81 → 0.80). WASM hits its steady-state inner-loop throughput almost immediately — SIMD128 is a simple ISA and TurboFan produces roughly the same code density regardless of loop trip count.
 - **Native ns/MADD drops ~2×** as N grows (0.12 → 0.054). Modern x86 has features that need runway to fully engage: out-of-order execution filling the reservation station, the hardware cache prefetcher learning the stride, branch predictor locking onto "taken", micro-op fusion. At N=7200 (~10 μs of inner loop) these are still warming up; at N=72000 they've fully paid off.
 
-The apparent "growing WASM overhead" (6.7× → 15× as N grows) is not WASM getting slower — it is native getting faster at scale. Hypothesis is that the ≈15× reflects the WASM SIMD128 vs native AVX-512 width plus FMA-fusion gap (see core story bullet 6). Small-N ratios (~6× at N=7200) look smaller only because fixed per-call overhead partly masks the inner-loop cost on both platforms.
+The apparent "growing WASM overhead" (6.7× → 15× as N grows) is not WASM getting slower — it is native getting faster at scale (this is what the ns/MADD numbers show directly). **Our attribution of the ~15× asymptote to WASM SIMD128 vs native AVX-512 width + missing FMA fusion is a hypothesis** based on general knowledge of the WASM SIMD ISA and native x86 codegen — we have not confirmed it by inspecting the generated code. Small-N ratios (~6× at N=7200) look smaller only because fixed per-call overhead partly masks the inner-loop cost on both platforms.
 
 *This would be an interesting function to analyze in detail.*
 
@@ -114,7 +117,7 @@ If the model "open() = ~1.5 s; everything after is trivial" is right, then every
 | **`obspy_read_path_format`** (tarfile 4 + zipfile 1 + memmap 1) | 6 | 6 × 1500 + 83 = 9083 | 9184 | ✓ |
 | **`obspy_read_path`** (+ auto-detect probes) | ~6 + isFormat | +~1400 for probes → ~10500 | 10566 | ✓ |
 
-The entire story of "why is JupyterLite slow" reduces to **counting how many times `open()` is called**. Reducing that count is the highest-leverage optimization anywhere in the WASM-Python stack.
+Regardless of the underlying mechanism (service-worker fetch, eager materialization, or something else), the **empirical** conclusion is that most of the "why is JupyterLite slow" story reduces to **counting how many times `open()` is called**. Reducing that count is the highest-leverage optimization anywhere in the WASM-Python stack.
 
 ## The `/tmp` experiment — the slow `open()` is not universal
 
@@ -130,7 +133,7 @@ To test whether the 1.45 s `open()` cost is a xeus-python-wide phenomenon or spe
 
 The last two rows are the punchline: `obspy.read` from /tmp under WASM runs within **1.26× of native**. That means the entire 130× penalty for the same call from the notebook mount is not a WASM problem — it is a *notebook-FS-backend* problem, and /tmp shows what the same WASM stack can do when it's out of the way.
 
-**Interpretation.** `/tmp` in xeus-python is MEMFS (or equivalent in-heap mount): reading 12 MB in 1 ms = ~12 GB/s = native memcpy speed, `open()` at 30 μs = trivial hashmap lookup. **The 1.45 s open() cost is specific to whichever filesystem backend serves the notebook working directory** (likely a lazy-loading IndexedDB or fetch-cached shim). It is **not** a xeus-python or WASM limitation in general.
+**Interpretation.** `/tmp` in xeus-python behaves like a pure in-heap mount (MEMFS or equivalent): reading 12 MB in 1 ms = ~12 GB/s = native memcpy speed, `open()` at 30 μs = trivial hashmap lookup. **The 1.45 s open() cost is specific to whichever filesystem backend serves the notebook working directory** — this is measured. The precise mechanism (service-worker fetch, lazy IndexedDB load, or eager materialization) is **not yet directly confirmed** but the /tmp comparison rules out anything intrinsic to WASM or xeus-python. See core-story bullet 2 for the two leading candidates.
 
 **Consequence.** Copying a file to `/tmp` once and then reading it from there runs the entire ObsPy pipeline at native speed. Total wall-clock: `1700 ms (one-shot copy) + N × 90 ms` versus `N × 1535 ms` for the `BytesIO` trick — /tmp wins after just 2 reads of the same file, and works with libraries that don't accept file-like objects.
 
@@ -206,7 +209,7 @@ Additional per-notebook wins (each independently applicable):
 
 ### Ideas for xeus-python / jupyterlite-xeus (root-cause fixes)
 
-The bottleneck is the **notebook filesystem mount doing an eager full-file load on `open()`**. In decreasing order of ambition:
+The measured bottleneck is that each `open()` on the notebook filesystem mount takes ~1.5 s, regardless of what is read afterwards. **Two hypotheses about the mechanism** (see core-story bullet 2): each open goes through the service worker as an HTTP fetch, or the FS backend eagerly copies the whole file into the WASM heap on first open. The proposed fixes below would help under either hypothesis, but the right specific fix depends on which one is correct — worth an experiment (e.g. compare Chrome DevTools Network + Application panels with a paused breakpoint on `FS.open`).
 
 1. **Cache `open()`ed files within a session**: on first `open()`, materialize into a MEMFS-like slot; subsequent `open()`s on the same path return an in-memory view. Even a per-notebook-session LRU would collapse the compression-probe pathology from N × 1.5 s to a single 1.5 s cost per file.
 
