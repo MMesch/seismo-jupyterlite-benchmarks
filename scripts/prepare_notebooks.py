@@ -110,6 +110,7 @@ PRIMARY_NOTEBOOKS = {
         "micro/scipy_detrend_direct",
         "micro/np_correlate_sweep",
         "micro/np_fromfile",
+        "micro/tmp_fs_probes",
         "micro/plot_subparts",
         "plotting/rendering",
     ],
