@@ -84,6 +84,35 @@ PRIMARY_NOTEBOOKS = {
         "data loading/download",
         "main compute",
     ],
+    Path("Micro/MicroBench.ipynb"): [
+        "setup/imports/stdlib",
+        "setup/imports/numpy",
+        "setup/imports/scipy",
+        "setup/imports/obspy",
+        "setup/imports/wasm_compat",
+        "setup/model",
+        "setup/model",
+        "micro/read_bytes",
+        "micro/obspy_read_path",
+        "micro/obspy_read_path_format",
+        "micro/obspy_read_bytesio",
+        "micro/obspy_read_path_nocompress",
+        "micro/tarfile_is_tarfile",
+        "micro/zipfile_is_zipfile",
+        "micro/fs_chunk_sweep",
+        "micro/os_stat_batch",
+        "micro/bare_boundary_getpid",
+        "micro/fs_open_close_only",
+        "micro/fs_reads_4k_single_open",
+        "micro/fs_seek_read_small",
+        "micro/stream_detrend",
+        "micro/stream_bandpass",
+        "micro/scipy_detrend_direct",
+        "micro/np_correlate_sweep",
+        "micro/np_fromfile",
+        "micro/plot_subparts",
+        "plotting/rendering",
+    ],
 }
 
 EXTRA_NOTEBOOKS = {Path("ObsPy/Obspy_Emscripten_Demo.ipynb")}
@@ -132,6 +161,7 @@ def copy_benchmarked_inputs() -> None:
         Path("Noise"),
         Path("Inversion"),
         Path("ObsPy"),
+        Path("Micro"),
     ]
     for relative_root in wanted_roots:
         src_root = ORIGINALS / relative_root
