@@ -103,6 +103,7 @@ PRIMARY_NOTEBOOKS = {
         "micro/os_stat_batch",
         "micro/bare_boundary_getpid",
         "micro/fs_open_close_only",
+        "micro/fs_open_size_sweep",
         "micro/fs_reads_4k_single_open",
         "micro/fs_seek_read_small",
         "micro/stream_detrend",
